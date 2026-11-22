@@ -1,7 +1,7 @@
 # Delcom Blog - Frontend (ReactJS + Vite)
 
 Praktikum PABWE 2026 P9 - Studi Kasus. Frontend SPA multi-tier (Publik, Penulis, Admin) yang mengonsumsi
-backend `ifs24037-pabwe2026-sk-p9-be-golang-gin`.
+backend `ifs24021-pabwe2026-sk-p9-be-golang-gin`.
 
 ## Menjalankan (development)
 
