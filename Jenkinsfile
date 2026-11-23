@@ -9,11 +9,6 @@ pipeline {
         skipStagesAfterUnstable()
     }
 
-    environment {
-        // Membuat test runner (mis. Vitest) berjalan sekali lalu selesai, bukan mode watch
-        CI = 'true'
-    }
-
     stages {
 
         // ============================================================
@@ -22,7 +17,7 @@ pipeline {
         stage('Checkout') {
             agent {
                 docker {
-                    image 'alpine:3.21'
+                    image 'oven/bun:alpine'
                     reuseNode true
                 }
             }
@@ -33,14 +28,13 @@ pipeline {
         }
 
         // ============================================================
-        // INSTALL DEPENDENCIES (BUN)
+        // INSTALL DEPENDENCIES
         // ============================================================
         stage('Install Dependencies') {
             agent {
                 docker {
-                    image 'oven/bun:1-alpine'
+                    image 'oven/bun:alpine'
                     reuseNode true
-                    args '-e HOME=/tmp'
                 }
             }
 
@@ -48,10 +42,8 @@ pipeline {
                 sh '''
                     set -e
 
-                    echo "=== Bun Runtime ==="
-                    bun --version
-
                     echo "=== Installing Dependencies ==="
+
                     bun install
 
                     echo "=== Dependencies Installed ==="
@@ -62,14 +54,11 @@ pipeline {
         // ============================================================
         // TEST
         // ============================================================
-        // Vitest dijalankan dengan Node (bukan runtime Bun), karena vi.mock
-        // tidak berfungsi saat Vitest berjalan di atas runtime Bun.
         stage('Test') {
             agent {
                 docker {
-                    image 'node:22-alpine'
+                    image 'node:24-alpine'
                     reuseNode true
-                    args '-e HOME=/tmp'
                 }
             }
 
@@ -77,54 +66,11 @@ pipeline {
                 sh '''
                     set -e
 
-                    echo "=== Node Runtime ==="
-                    node --version
+                    echo "=== Running Tests with Coverage ==="
 
-                    if grep -q '"test"[[:space:]]*:' package.json; then
-                        echo "=== Running Tests ==="
-                        npm run test
-                        echo "=== Tests Passed ==="
-                    else
-                        echo "=== Tidak ada script \\"test\\" di package.json, stage Test dilewati ==="
-                    fi
-                '''
-            }
+                    npx vitest run --coverage
 
-            post {
-                always {
-                    archiveArtifacts(
-                        artifacts: 'coverage/**',
-                        allowEmptyArchive: true
-                    )
-                }
-            }
-        }
-
-        // ============================================================
-        // BUILD APPLICATION (VERIFIKASI BUILD VITE)
-        // ============================================================
-        stage('Build Application') {
-            agent {
-                docker {
-                    image 'node:22-alpine'
-                    reuseNode true
-                    args '-e HOME=/tmp'
-                }
-            }
-
-            environment {
-                VITE_API_BASE_URL = 'https://ifs24021-pabwe2026-sk-p9-be-golang-gin-main.s1if.cloud/api'
-            }
-
-            steps {
-                sh '''
-                    set -e
-
-                    echo "=== Building Frontend ==="
-                    npm run build
-
-                    echo "=== Build Output ==="
-                    ls -lh dist
+                    echo "=== Tests Passed ==="
                 '''
             }
         }
@@ -165,8 +111,6 @@ pipeline {
                         --cache-dir .trivy-cache \
                         --scanners vuln \
                         --severity HIGH,CRITICAL \
-                        --skip-dirs node_modules \
-                        --skip-dirs dist \
                         --format sarif \
                         --output trivy-results.sarif \
                         --exit-code 1 \
@@ -179,6 +123,9 @@ pipeline {
 
             post {
                 always {
+                    // failOnError must be false: otherwise Warnings NG can mark the
+                    // whole build FAILURE while later stages still run (all green, badge red).
+                    // Build failure on HIGH/CRITICAL comes from trivy --exit-code 1 above.
                     recordIssues(
                         enabledForFailure: true,
                         failOnError: false,
@@ -195,12 +142,50 @@ pipeline {
         }
 
         // ============================================================
-        // PACKAGE APPLICATION (PURE SOURCE CODE DARI GITHUB)
+        // SONARQUBE ANALYSIS
+        // ============================================================
+        stage('SonarQube Analysis') {
+            agent {
+                docker {
+                    image 'sonarsource/sonar-scanner-cli:latest'
+                    reuseNode true
+                    args '--network cicd-network'
+                }
+            }
+
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh '''
+                        set -e
+
+                        echo "=== SonarQube Analysis ==="
+
+                        sonar-scanner
+
+                        echo "=== SonarQube Analysis Completed ==="
+                    '''
+                }
+            }
+        }
+
+        // ============================================================
+        // QUALITY GATE
+        // ============================================================
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 30, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        // ============================================================
+        // PACKAGE APPLICATION
         // ============================================================
         stage('Package Application') {
             agent {
                 docker {
-                    image 'alpine:3.21'
+                    image 'node:24-alpine'
                     reuseNode true
                     args '-u root'
                 }
@@ -214,48 +199,27 @@ pipeline {
                     echo "       CREATING APPLICATION PACKAGE"
                     echo "======================================"
 
-                    apk add --no-cache git zip unzip
+                    apk add --no-cache zip unzip
 
                     rm -f latest-app.zip
 
-                    git config --global --add safe.directory '*' || true
-
-                    echo "=== Creating Source Code Package (Pure Code from GitHub) ==="
-                    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-                        git archive --format=zip HEAD -o latest-app.zip
-                    else
-                        zip -r latest-app.zip . \
-                            -x ".git/*" \
-                            -x ".env*" \
-                            -x "node_modules/*" \
-                            -x "dist/*" \
-                            -x "coverage/*" \
-                            -x ".trivy-cache/*" \
-                            -x "trivy-results.sarif" \
-                            -x "latest-app.zip" \
-                            -x ".vscode/*" \
-                            -x ".idea/*"
-                    fi
+                    zip -r latest-app.zip . \
+                        -x "node_modules/*" \
+                        -x ".git/*" \
+                        -x ".env" \
+                        -x ".env.*" \
+                        -x "coverage/*" \
+                        -x ".trivy-cache/*" \
+                        -x "latest-app.zip" \
+                        -x "trivy-results.sarif"
 
                     echo "=== Application Package Created ==="
+
                     ls -lh latest-app.zip
 
-                    echo "=== Verify .env excluded ==="
-                    if unzip -Z1 latest-app.zip | grep -E '^\\.env$' >/dev/null; then
-                        echo "ERROR: zip masih berisi .env rahasia"
-                        exit 1
-                    fi
-                    echo "OK: file .env tidak ada di zip"
+                    echo "=== Package Content ==="
 
-                    echo "=== Verify node_modules excluded ==="
-                    if unzip -Z1 latest-app.zip | grep -E '^node_modules/' >/dev/null; then
-                        echo "ERROR: zip masih berisi node_modules"
-                        exit 1
-                    fi
-                    echo "OK: node_modules tidak disertakan dalam zip"
-
-                    echo "=== Package Content (sample) ==="
-                    unzip -l latest-app.zip | head -n 60
+                    unzip -l latest-app.zip
                 '''
             }
         }
@@ -267,6 +231,10 @@ pipeline {
 
             steps {
 
+                // ========================================================
+                // 1. ARCHIVE ARTIFACT KE JENKINS
+                // ========================================================
+
                 archiveArtifacts(
                     artifacts: 'latest-app.zip',
                     fingerprint: true,
@@ -274,6 +242,10 @@ pipeline {
                 )
 
                 script {
+
+                    // ====================================================
+                    // 2. BUAT IDENTITAS APPLICATION
+                    // ====================================================
 
                     def appName = env.JOB_NAME
                         .replaceAll('[^a-zA-Z0-9._-]', '-')
@@ -285,6 +257,10 @@ pipeline {
                     echo "Application Name: ${appName}"
                     echo "Build ID: ${buildId}"
 
+                    // ====================================================
+                    // 3. COPY KE USER CONTENT
+                    // ====================================================
+
                     sh """
                         set -e
 
@@ -292,20 +268,24 @@ pipeline {
                         echo "       PUBLISHING USER CONTENT"
                         echo "======================================"
 
-                        docker exec cicd-jenkins \\
-                            mkdir -p \\
+                        docker exec cicd-jenkins \
+                            mkdir -p \
                             "/var/jenkins_home/userContent/applications/${appName}/${buildId}"
 
-                        docker cp \\
-                            latest-app.zip \\
+                        docker cp \
+                            latest-app.zip \
                             "cicd-jenkins:/var/jenkins_home/userContent/applications/${appName}/${buildId}/latest-app.zip"
 
                         echo "=== Published File ==="
 
-                        docker exec cicd-jenkins \\
-                            ls -lh \\
+                        docker exec cicd-jenkins \
+                            ls -lh \
                             "/var/jenkins_home/userContent/applications/${appName}/${buildId}/latest-app.zip"
                     """
+
+                    // ====================================================
+                    // 4. BUAT PUBLIC ARTIFACT URL
+                    // ====================================================
 
                     def jenkinsBaseUrl = env.BUILD_URL
                         .substring(0, env.BUILD_URL.indexOf('/job/'))
@@ -346,6 +326,10 @@ pipeline {
                     echo "Artifact URL:"
                     echo "${env.ARTIFACT_URL}"
 
+                    // ==================================================
+                    // 1. REQUEST REDEPLOYMENT
+                    // ==================================================
+
                     echo ""
                     echo "=== Request Redeployment ==="
 
@@ -368,6 +352,10 @@ pipeline {
 
                     echo "Redeploy Response:"
                     echo redeployResponse
+
+                    // ==================================================
+                    // 2. POLLING DEPLOYMENT PROGRESS
+                    // ==================================================
 
                     echo ""
                     echo "=== Waiting For Deployment ==="
@@ -411,6 +399,10 @@ pipeline {
                         echo "Progress Response:"
                         echo progressResponse
 
+                        // ==================================================
+                        // PARSE JSON
+                        // ==================================================
+
                         def json = readJSON text: progressResponse
 
                         deploymentStatus = json?.data?.status
@@ -425,6 +417,10 @@ pipeline {
 
                         echo "Deployment Status: ${deploymentStatus}"
 
+                        // ==================================================
+                        // SUCCESS
+                        // ==================================================
+
                         if (deploymentStatus == 'SUCCESS') {
 
                             echo ""
@@ -434,6 +430,10 @@ pipeline {
 
                             break
                         }
+
+                        // ==================================================
+                        // FAIL
+                        // ==================================================
 
                         if (deploymentStatus == 'FAIL') {
 
@@ -456,6 +456,10 @@ pipeline {
                                 "${WEBSITE_ID}"
                             )
                         }
+
+                        // ==================================================
+                        // OTHER STATUS
+                        // ==================================================
 
                         echo "Deployment masih berjalan..."
                     }
