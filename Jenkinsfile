@@ -9,6 +9,11 @@ pipeline {
         skipStagesAfterUnstable()
     }
 
+    environment {
+        // Membuat test runner (mis. Vitest) berjalan sekali lalu selesai, bukan mode watch
+        CI = 'true'
+    }
+
     stages {
 
         // ============================================================
@@ -28,19 +33,14 @@ pipeline {
         }
 
         // ============================================================
-        // INSTALL DEPENDENCIES
+        // INSTALL DEPENDENCIES (BUN)
         // ============================================================
         stage('Install Dependencies') {
             agent {
                 docker {
-                    image 'golang:1.27-alpine'
+                    image 'oven/bun:1-alpine'
                     reuseNode true
-                    args '''
-                        -e HOME=/tmp
-                        -e GOCACHE=/go-cache/build
-                        -e GOMODCACHE=/go-cache/mod
-                        -v cicd-go-cache:/go-cache
-                    '''
+                    args '-e HOME=/tmp'
                 }
             }
 
@@ -48,39 +48,26 @@ pipeline {
                 sh '''
                     set -e
 
-                    echo "=== Go Runtime ==="
-                    go version
+                    echo "=== Bun Runtime ==="
+                    bun --version
 
-                    if [ ! -f /go-cache/mod/.stamp ] \
-                        || [ go.mod -nt /go-cache/mod/.stamp ] \
-                        || [ go.sum -nt /go-cache/mod/.stamp ]; then
-                        echo "=== Downloading Go Modules ==="
-                        go mod download
-                        go mod verify
-                        touch /go-cache/mod/.stamp
-                    else
-                        echo "=== go.mod/go.sum unchanged, using cached modules ==="
-                    fi
+                    echo "=== Installing Dependencies ==="
+                    bun install
 
-                    echo "=== Go Dependencies Installed ==="
+                    echo "=== Dependencies Installed ==="
                 '''
             }
         }
 
         // ============================================================
-        // TEST & COVERAGE
+        // TEST
         // ============================================================
         stage('Test') {
             agent {
                 docker {
-                    image 'golang:1.27-alpine'
+                    image 'oven/bun:1-alpine'
                     reuseNode true
-                    args '''
-                        -e HOME=/tmp
-                        -e GOCACHE=/go-cache/build
-                        -e GOMODCACHE=/go-cache/mod
-                        -v cicd-go-cache:/go-cache
-                    '''
+                    args '-e HOME=/tmp'
                 }
             }
 
@@ -88,20 +75,20 @@ pipeline {
                 sh '''
                     set -e
 
-                    echo "=== Running Go Tests with Statement Coverage ==="
-                    go test -v -coverprofile=coverage.out -covermode=atomic ./...
-
-                    echo "=== Coverage Summary by Function ==="
-                    go tool cover -func=coverage.out
-
-                    echo "=== Tests Passed ==="
+                    if grep -q '"test"[[:space:]]*:' package.json; then
+                        echo "=== Running Tests ==="
+                        bun run test
+                        echo "=== Tests Passed ==="
+                    else
+                        echo "=== Tidak ada script \\"test\\" di package.json, stage Test dilewati ==="
+                    fi
                 '''
             }
 
             post {
                 always {
                     archiveArtifacts(
-                        artifacts: 'coverage.out',
+                        artifacts: 'coverage/**',
                         allowEmptyArchive: true
                     )
                 }
@@ -109,32 +96,30 @@ pipeline {
         }
 
         // ============================================================
-        // BUILD APPLICATION BINARY
+        // BUILD APPLICATION (VERIFIKASI BUILD VITE)
         // ============================================================
         stage('Build Application') {
             agent {
                 docker {
-                    image 'golang:1.27-alpine'
+                    image 'oven/bun:1-alpine'
                     reuseNode true
-                    args '''
-                        -e HOME=/tmp
-                        -e GOCACHE=/go-cache/build
-                        -e GOMODCACHE=/go-cache/mod
-                        -v cicd-go-cache:/go-cache
-                    '''
+                    args '-e HOME=/tmp'
                 }
+            }
+
+            environment {
+                VITE_API_BASE_URL = 'https://ifs24021-pabwe2026-sk-p9-be-golang-gin-main.s1if.cloud/api'
             }
 
             steps {
                 sh '''
                     set -e
 
-                    echo "=== Compiling Standalone Linux Binary ==="
-                    CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o server .
+                    echo "=== Building Frontend ==="
+                    bun run build
 
-                    echo "=== Binary Created ==="
-                    ls -lh server
-                    file server || true
+                    echo "=== Build Output ==="
+                    ls -lh dist
                 '''
             }
         }
@@ -175,6 +160,8 @@ pipeline {
                         --cache-dir .trivy-cache \
                         --scanners vuln \
                         --severity HIGH,CRITICAL \
+                        --skip-dirs node_modules \
+                        --skip-dirs dist \
                         --format sarif \
                         --output trivy-results.sarif \
                         --exit-code 1 \
@@ -235,15 +222,9 @@ pipeline {
                         zip -r latest-app.zip . \
                             -x ".git/*" \
                             -x ".env*" \
-                            -x "server" \
-                            -x "server.exe" \
-                            -x "main" \
-                            -x "app" \
-                            -x "*.out" \
-                            -x "*.test" \
-                            -x "*.prof" \
-                            -x "cov*" \
-                            -x "coverage*" \
+                            -x "node_modules/*" \
+                            -x "dist/*" \
+                            -x "coverage/*" \
                             -x ".trivy-cache/*" \
                             -x "trivy-results.sarif" \
                             -x "latest-app.zip" \
@@ -261,12 +242,12 @@ pipeline {
                     fi
                     echo "OK: file .env tidak ada di zip"
 
-                    echo "=== Verify build binary excluded ==="
-                    if unzip -Z1 latest-app.zip | grep -E '^server$' >/dev/null; then
-                        echo "ERROR: zip masih berisi biner hasil build"
+                    echo "=== Verify node_modules excluded ==="
+                    if unzip -Z1 latest-app.zip | grep -E '^node_modules/' >/dev/null; then
+                        echo "ERROR: zip masih berisi node_modules"
                         exit 1
                     fi
-                    echo "OK: biner hasil build tidak disertakan dalam zip"
+                    echo "OK: node_modules tidak disertakan dalam zip"
 
                     echo "=== Package Content (sample) ==="
                     unzip -l latest-app.zip | head -n 60
@@ -281,10 +262,6 @@ pipeline {
 
             steps {
 
-                // ========================================================
-                // 1. ARCHIVE ARTIFACT KE JENKINS
-                // ========================================================
-
                 archiveArtifacts(
                     artifacts: 'latest-app.zip',
                     fingerprint: true,
@@ -292,10 +269,6 @@ pipeline {
                 )
 
                 script {
-
-                    // ====================================================
-                    // 2. BUAT IDENTITAS APPLICATION
-                    // ====================================================
 
                     def appName = env.JOB_NAME
                         .replaceAll('[^a-zA-Z0-9._-]', '-')
@@ -306,10 +279,6 @@ pipeline {
 
                     echo "Application Name: ${appName}"
                     echo "Build ID: ${buildId}"
-
-                    // ====================================================
-                    // 3. COPY KE USER CONTENT
-                    // ====================================================
 
                     sh """
                         set -e
@@ -332,10 +301,6 @@ pipeline {
                             ls -lh \\
                             "/var/jenkins_home/userContent/applications/${appName}/${buildId}/latest-app.zip"
                     """
-
-                    // ====================================================
-                    // 4. BUAT PUBLIC ARTIFACT URL
-                    // ====================================================
 
                     def jenkinsBaseUrl = env.BUILD_URL
                         .substring(0, env.BUILD_URL.indexOf('/job/'))
@@ -376,10 +341,6 @@ pipeline {
                     echo "Artifact URL:"
                     echo "${env.ARTIFACT_URL}"
 
-                    // ==================================================
-                    // 1. REQUEST REDEPLOYMENT
-                    // ==================================================
-
                     echo ""
                     echo "=== Request Redeployment ==="
 
@@ -402,10 +363,6 @@ pipeline {
 
                     echo "Redeploy Response:"
                     echo redeployResponse
-
-                    // ==================================================
-                    // 2. POLLING DEPLOYMENT PROGRESS
-                    // ==================================================
 
                     echo ""
                     echo "=== Waiting For Deployment ==="
@@ -449,10 +406,6 @@ pipeline {
                         echo "Progress Response:"
                         echo progressResponse
 
-                        // ==================================================
-                        // PARSE JSON
-                        // ==================================================
-
                         def json = readJSON text: progressResponse
 
                         deploymentStatus = json?.data?.status
@@ -467,10 +420,6 @@ pipeline {
 
                         echo "Deployment Status: ${deploymentStatus}"
 
-                        // ==================================================
-                        // SUCCESS
-                        // ==================================================
-
                         if (deploymentStatus == 'SUCCESS') {
 
                             echo ""
@@ -480,10 +429,6 @@ pipeline {
 
                             break
                         }
-
-                        // ==================================================
-                        // FAIL
-                        // ==================================================
 
                         if (deploymentStatus == 'FAIL') {
 
@@ -506,10 +451,6 @@ pipeline {
                                 "${WEBSITE_ID}"
                             )
                         }
-
-                        // ==================================================
-                        // OTHER STATUS
-                        // ==================================================
 
                         echo "Deployment masih berjalan..."
                     }
