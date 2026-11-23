@@ -62,10 +62,12 @@ pipeline {
         // ============================================================
         // TEST
         // ============================================================
+        // Vitest dijalankan dengan Node (bukan runtime Bun), karena vi.mock
+        // tidak berfungsi saat Vitest berjalan di atas runtime Bun.
         stage('Test') {
             agent {
                 docker {
-                    image 'oven/bun:1-alpine'
+                    image 'node:22-alpine'
                     reuseNode true
                     args '-e HOME=/tmp'
                 }
@@ -75,9 +77,12 @@ pipeline {
                 sh '''
                     set -e
 
+                    echo "=== Node Runtime ==="
+                    node --version
+
                     if grep -q '"test"[[:space:]]*:' package.json; then
                         echo "=== Running Tests ==="
-                        bun run test
+                        npm run test
                         echo "=== Tests Passed ==="
                     else
                         echo "=== Tidak ada script \\"test\\" di package.json, stage Test dilewati ==="
@@ -101,7 +106,7 @@ pipeline {
         stage('Build Application') {
             agent {
                 docker {
-                    image 'oven/bun:1-alpine'
+                    image 'node:22-alpine'
                     reuseNode true
                     args '-e HOME=/tmp'
                 }
@@ -116,7 +121,7 @@ pipeline {
                     set -e
 
                     echo "=== Building Frontend ==="
-                    bun run build
+                    npm run build
 
                     echo "=== Build Output ==="
                     ls -lh dist
